@@ -1101,7 +1101,7 @@ func SuggestIPAllocation(db store.IStore) echo.HandlerFunc {
 		for _, cidr := range searchCIDRList {
 			ip, err := util.GetAvailableIP(cidr, allocatedIPs, server.Interface.Addresses)
 			if err != nil {
-				log.Error("Failed to get available ip from a CIDR: ", err)
+				log.Errorf("Failed to get available IP from CIDR %s: %v", cidr, err)
 				continue
 			}
 			found = true
