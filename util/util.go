@@ -62,13 +62,19 @@ func BuildClientConfig(client model.Client, server model.Server, setting model.G
 
 	desiredHost := setting.EndpointAddress
 	desiredPort := server.Interface.ListenPort
-	if strings.Contains(desiredHost, ":") {
-		split := strings.Split(desiredHost, ":")
-		desiredHost = split[0]
-		if n, err := strconv.Atoi(split[1]); err == nil {
-			desiredPort = n
-		} else {
-			log.Error("Endpoint appears to be incorrectly formatted: ", err)
+	if strings.Contains(desiredHost, ":") && !strings.Contains(desiredHost, "[") {
+		// If the host contains colons but not enclosed in brackets, it's an IPv6 address
+		desiredHost = fmt.Sprintf("[%s]", desiredHost) // Enclose IPv6 address in square brackets
+	} else if strings.Contains(desiredHost, ":") && strings.Contains(desiredHost, "[") {
+		// Address is already in IPv6 format, split without removing brackets
+		split := strings.Split(desiredHost, "]:")
+		if len(split) == 2 { // Split based on closing bracket and port
+			desiredHost = split[0] + "]"
+			if n, err := strconv.Atoi(split[1]); err == nil {
+				desiredPort = n
+			} else {
+				log.Error("Endpoint appears to be incorrectly formatted: ", err)
+			}
 		}
 	}
 	peerEndpoint := fmt.Sprintf("Endpoint = %s:%d\n", desiredHost, desiredPort)
@@ -210,10 +216,6 @@ func GetInterfaceIPs() ([]model.Interface, error) {
 			if ip == nil || ip.IsLoopback() {
 				continue
 			}
-			ip = ip.To4()
-			if ip == nil {
-				continue
-			}
 
 			iface := model.Interface{}
 			iface.Name = i.Name
@@ -224,29 +226,39 @@ func GetInterfaceIPs() ([]model.Interface, error) {
 	return interfaceList, err
 }
 
-// GetPublicIP to get machine's public ip address
+// GetPublicIP to get machine's public IP address, both IPv4 and IPv6
+// GetPublicIP to get machine's public ip address with IPv4 and IPv6 support
 func GetPublicIP() (model.Interface, error) {
-	// set time out to 5 seconds
-	cfg := externalip.ConsensusConfig{}
-	cfg.Timeout = time.Second * 5
-	consensus := externalip.NewConsensus(&cfg, nil)
+	consensus := externalip.NewConsensus(nil, nil)
 
-	// add trusted voters
-	consensus.AddVoter(externalip.NewHTTPSource("https://checkip.amazonaws.com/"), 1)
+	// add trusted voters for both IPv4 and IPv6
+	consensus.UseIPProtocol(uint(4))
+	consensus.AddVoter(externalip.NewHTTPSource("https://api.ipify.org?format=text"), 1)
 	consensus.AddVoter(externalip.NewHTTPSource("http://whatismyip.akamai.com"), 1)
-	consensus.AddVoter(externalip.NewHTTPSource("https://ifconfig.top"), 1)
+
+	consensus.UseIPProtocol(uint(6))
+	consensus.AddVoter(externalip.NewHTTPSource("https://api6.ipify.org?format=text"), 1)
 
 	publicInterface := model.Interface{}
 	publicInterface.Name = "Public Address"
 
+	// Try to get IPv4 address
 	ip, err := consensus.ExternalIP()
-	if err != nil {
-		publicInterface.IPAddress = "N/A"
-	} else {
+	if err == nil {
 		publicInterface.IPAddress = ip.String()
+	} else {
+		publicInterface.IPAddress = "N/A"
 	}
 
-	// error handling happened above, no need to pass it through
+	// Try to get IPv6 address
+	consensus.UseIPProtocol(6)
+	ipv6, err := consensus.ExternalIP()
+	if err == nil {
+		publicInterface.IPAddress = ipv6.String()
+	} else {
+		publicInterface.IPAddress = "N/A"
+	}
+
 	return publicInterface, nil
 }
 
@@ -259,7 +271,7 @@ func GetIPFromCIDR(cidr string) (string, error) {
 	return ip.String(), nil
 }
 
-// GetAllocatedIPs to get all ip addresses allocated to clients and server
+// GetAllocatedIPs to get all ip addresses (IPv4 and IPv6) allocated to clients and server
 func GetAllocatedIPs(ignoreClientID string) ([]string, error) {
 	allocatedIPs := make([]string, 0)
 
@@ -276,13 +288,13 @@ func GetAllocatedIPs(ignoreClientID string) ([]string, error) {
 		return nil, err
 	}
 
-	// append server's addresses to the result
+	// append server's addresses (IPv4 and IPv6) to the result
 	for _, cidr := range serverInterface.Addresses {
-		ip, err := GetIPFromCIDR(cidr)
+		ip, _, err := net.ParseCIDR(cidr)
 		if err != nil {
 			return nil, err
 		}
-		allocatedIPs = append(allocatedIPs, ip)
+		allocatedIPs = append(allocatedIPs, ip.String())
 	}
 
 	// read client information
@@ -291,7 +303,7 @@ func GetAllocatedIPs(ignoreClientID string) ([]string, error) {
 		return nil, err
 	}
 
-	// append client's addresses to the result
+	// append client's addresses (IPv4 and IPv6) to the result
 	for _, f := range records {
 		client := model.Client{}
 		if err := json.Unmarshal(f, &client); err != nil {
@@ -300,11 +312,11 @@ func GetAllocatedIPs(ignoreClientID string) ([]string, error) {
 
 		if client.ID != ignoreClientID {
 			for _, cidr := range client.AllocatedIPs {
-				ip, err := GetIPFromCIDR(cidr)
+				ip, _, err := net.ParseCIDR(cidr)
 				if err != nil {
 					return nil, err
 				}
-				allocatedIPs = append(allocatedIPs, ip)
+				allocatedIPs = append(allocatedIPs, ip.String())
 			}
 		}
 	}
@@ -322,21 +334,22 @@ func inc(ip net.IP) {
 	}
 }
 
-// GetBroadcastIP func to get the broadcast ip address of a network
+// GetBroadcastIP func to get the broadcast ip address of a network, returns the input for IPv6
 func GetBroadcastIP(n *net.IPNet) net.IP {
-	var broadcast net.IP
-	if len(n.IP) == 4 {
-		broadcast = net.ParseIP("0.0.0.0").To4()
-	} else {
-		broadcast = net.ParseIP("::")
+	// Directly return the input IP if it's an IPv6 address
+	if len(n.IP) == 16 {
+		return n.IP
 	}
+
+	// IPv4 broadcast calculation
+	var broadcast net.IP = make(net.IP, len(n.IP))
 	for i := 0; i < len(n.IP); i++ {
 		broadcast[i] = n.IP[i] | ^n.Mask[i]
 	}
 	return broadcast
 }
 
-// GetBroadcastAndNetworkAddrsLookup get the ip address that can't be used with current server interfaces
+// GetBroadcastAndNetworkAddrsLookup get the addresses that can't be used within given interface addresses (IPv4 and IPv6)
 func GetBroadcastAndNetworkAddrsLookup(interfaceAddresses []string) map[string]bool {
 	list := make(map[string]bool)
 	for _, ifa := range interfaceAddresses {
@@ -345,16 +358,26 @@ func GetBroadcastAndNetworkAddrsLookup(interfaceAddresses []string) map[string]b
 			continue
 		}
 
-		broadcastAddr := GetBroadcastIP(netAddr).String()
-		networkAddr := netAddr.IP.String()
-		list[broadcastAddr] = true
-		list[networkAddr] = true
+		// For IPv4, add both network and broadcast addresses to the exclusion list
+		if len(netAddr.IP) == 4 {
+			broadcastAddr := GetBroadcastIP(netAddr).String()
+			networkAddr := netAddr.IP.String()
+			list[broadcastAddr] = true
+			list[networkAddr] = true
+		}
+
+		// For IPv6, just add the network address to the exclusion list
+		if len(netAddr.IP) == 16 {
+			networkAddr := netAddr.IP.String()
+			list[networkAddr] = true
+		}
 	}
 	return list
 }
 
 // GetAvailableIP get the ip address that can be allocated from an CIDR
 // We need interfaceAddresses to find real broadcast and network addresses
+// GetAvailableIP get an available IP address (IPv4 or IPv6) from a CIDR, considering allocated and interface addresses
 func GetAvailableIP(cidr string, allocatedList, interfaceAddresses []string) (string, error) {
 	ip, netAddr, err := net.ParseCIDR(cidr)
 	if err != nil {
@@ -375,32 +398,39 @@ func GetAvailableIP(cidr string, allocatedList, interfaceAddresses []string) (st
 		if available && !unavailableIPs[suggestedAddr] {
 			return suggestedAddr, nil
 		}
+
+		// For IPv6, increment by a larger step to avoid excessive iteration
+		if len(ip) == 16 {
+			for j := 15; j >= 0; j-- {
+				ip[j] += 0x10
+				if ip[j] != 0 {
+					break
+				}
+			}
+		}
 	}
 
-	return "", errors.New("no more available ip address")
+	return "", errors.New("no available IP address found in the specified range")
 }
 
-// ValidateIPAllocation to validate the list of client's ip allocation
-// They must have a correct format and available in serverAddresses space
+// ValidateIPAllocation to validate the list of client's IP allocations (IPv4 and IPv6)
+// They must have a correct format and be available in the serverAddresses space
 func ValidateIPAllocation(serverAddresses []string, ipAllocatedList []string, ipAllocationList []string) (bool, error) {
 	for _, clientCIDR := range ipAllocationList {
-		ip, _, _ := net.ParseCIDR(clientCIDR)
-
-		// clientCIDR must be in CIDR format
-		if ip == nil {
-			return false, fmt.Errorf("invalid ip allocation input %s. Must be in CIDR format", clientCIDR)
+		ip, _, err := net.ParseCIDR(clientCIDR)
+		if err != nil {
+			return false, fmt.Errorf("invalid IP allocation input %s. Must be in CIDR format", clientCIDR)
 		}
 
-		// return false immediately if the ip is already in use (in ipAllocatedList)
-		for _, item := range ipAllocatedList {
-			if item == ip.String() {
+		// Check if the IP is already allocated
+		for _, allocatedAddr := range ipAllocatedList {
+			if allocatedAddr == ip.String() {
 				return false, fmt.Errorf("IP %s already allocated", ip)
 			}
 		}
 
-		// even if it is not in use, we still need to check if it
-		// belongs to a network of the server.
-		var isValid = false
+		// Check if the IP belongs to the server's network
+		isValid := false
 		for _, serverCIDR := range serverAddresses {
 			_, serverNet, _ := net.ParseCIDR(serverCIDR)
 			if serverNet.Contains(ip) {
@@ -409,18 +439,15 @@ func ValidateIPAllocation(serverAddresses []string, ipAllocatedList []string, ip
 			}
 		}
 
-		// current ip allocation is valid, check the next one
-		if isValid {
-			continue
-		} else {
-			return false, fmt.Errorf("IP %s does not belong to any network addresses of WireGuard server", ip)
+		if !isValid {
+			return false, fmt.Errorf("IP %s does not belong to any network addresses of the server", ip)
 		}
 	}
 
 	return true, nil
 }
 
-// findSubnetRangeForIP to find first SR for IP, and cache the match
+// findSubnetRangeForIP to find the subnet range for a given IP, supports both IPv4 and IPv6
 func findSubnetRangeForIP(cidr string) (uint16, error) {
 	ip, _, err := net.ParseCIDR(cidr)
 	if err != nil {
@@ -439,16 +466,17 @@ func findSubnetRangeForIP(cidr string) (uint16, error) {
 			}
 		}
 	}
+
 	return 0, fmt.Errorf("subnet range not found for this IP")
 }
 
-// FillClientSubnetRange to fill subnet ranges client belongs to, does nothing if SRs are not found
+// FillClientSubnetRange to fill subnet ranges the client belongs to, supports IPv4 and IPv6
 func FillClientSubnetRange(client model.ClientData) model.ClientData {
 	cl := *client.Client
 	for _, ip := range cl.AllocatedIPs {
 		sr, err := findSubnetRangeForIP(ip)
 		if err != nil {
-			continue
+			continue // If no matching subnet range is found, just continue to the next IP
 		}
 		cl.SubnetRanges = append(cl.SubnetRanges, SubnetRangesOrder[sr])
 	}
@@ -458,17 +486,17 @@ func FillClientSubnetRange(client model.ClientData) model.ClientData {
 	}
 }
 
-// ValidateAndFixSubnetRanges to check if subnet ranges are valid for the server configuration
-// Removes all non-valid CIDRs
+// ValidateAndFixSubnetRanges checks if subnet ranges are valid for the server configuration and adjusts them as needed
 func ValidateAndFixSubnetRanges(db store.IStore) error {
 	if len(SubnetRangesOrder) == 0 {
-		return nil
+		return nil // No subnet ranges defined
 	}
 
 	server, err := db.GetServer()
 	if err != nil {
 		return err
 	}
+
 	var serverSubnets []*net.IPNet
 	for _, addr := range server.Interface.Addresses {
 		addr = strings.TrimSpace(addr)
@@ -485,21 +513,18 @@ func ValidateAndFixSubnetRanges(db store.IStore) error {
 			newCIDRs := make([]*net.IPNet, 0)
 			for _, cidr := range cidrs {
 				valid := false
-
 				for _, serverSubnet := range serverSubnets {
 					if ContainsCIDR(serverSubnet, cidr) {
 						valid = true
 						break
 					}
 				}
-
 				if valid {
 					newCIDRs = append(newCIDRs, cidr)
 				} else {
 					log.Warnf("[%v] CIDR is outside of all server subnets: %v. Removed.", rng, cidr)
 				}
 			}
-
 			if len(newCIDRs) > 0 {
 				SubnetRanges[rng] = newCIDRs
 			} else {
@@ -512,32 +537,29 @@ func ValidateAndFixSubnetRanges(db store.IStore) error {
 	return nil
 }
 
-// GetSubnetRangesString to get a formatted string, representing active subnet ranges
+// GetSubnetRangesString to get a formatted string representing active subnet ranges (IPv4 and IPv6)
 func GetSubnetRangesString() string {
 	if len(SubnetRangesOrder) == 0 {
-		return ""
+		return "" // No subnet ranges defined
 	}
 
-	strB := strings.Builder{}
+	var strBuilder strings.Builder
 
 	for _, rng := range SubnetRangesOrder {
 		cidrs := SubnetRanges[rng]
 		if len(cidrs) > 0 {
-			strB.WriteString(rng)
-			strB.WriteString(":[")
-			first := true
-			for _, cidr := range cidrs {
-				if !first {
-					strB.WriteString(", ")
+			strBuilder.WriteString(rng + ": [")
+			for i, cidr := range cidrs {
+				if i > 0 {
+					strBuilder.WriteString(", ")
 				}
-				strB.WriteString(cidr.String())
-				first = false
+				strBuilder.WriteString(cidr.String())
 			}
-			strB.WriteString("]  ")
+			strBuilder.WriteString("]  ")
 		}
 	}
 
-	return strings.TrimSpace(strB.String())
+	return strings.TrimSpace(strBuilder.String())
 }
 
 // WriteWireGuardServerConfig to write Wireguard server config. e.g. wg0.conf
