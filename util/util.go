@@ -325,12 +325,14 @@ func GetAllocatedIPs(ignoreClientID string) ([]string, error) {
 }
 
 // inc from https://play.golang.org/p/m8TNTtygK0
+// Increment the IP address by one, handling both IPv4 and IPv6
 func inc(ip net.IP) {
 	for j := len(ip) - 1; j >= 0; j-- {
 		ip[j]++
-		if ip[j] > 0 {
-			break
+		if ip[j] != 0 {
+			break // No overflow, stop
 		}
+		// If byte is 0, overflow occurred, continue to increment the next byte
 	}
 }
 
@@ -385,32 +387,25 @@ func GetAvailableIP(cidr string, allocatedList, interfaceAddresses []string) (st
 	}
 
 	unavailableIPs := GetBroadcastAndNetworkAddrsLookup(interfaceAddresses)
-
+	// Start from the first IP in the range
 	for ip := ip.Mask(netAddr.Mask); netAddr.Contains(ip); inc(ip) {
-		available := true
 		suggestedAddr := ip.String()
-		for _, allocatedAddr := range allocatedList {
-			if suggestedAddr == allocatedAddr {
-				available = false
-				break
-			}
-		}
-		if available && !unavailableIPs[suggestedAddr] {
+		if !unavailableIPs[suggestedAddr] && !contains(allocatedList, suggestedAddr) {
 			return suggestedAddr, nil
-		}
-
-		// For IPv6, increment by a larger step to avoid excessive iteration
-		if len(ip) == 16 {
-			for j := 15; j >= 0; j-- {
-				ip[j] += 0x10
-				if ip[j] != 0 {
-					break
-				}
-			}
 		}
 	}
 
 	return "", errors.New("no available IP address found in the specified range")
+}
+
+// contains checks if a slice contains a string
+func contains(slice []string, str string) bool {
+	for _, s := range slice {
+		if s == str {
+			return true
+		}
+	}
+	return false
 }
 
 // ValidateIPAllocation to validate the list of client's IP allocations (IPv4 and IPv6)
